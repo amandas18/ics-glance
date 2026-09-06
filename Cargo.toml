@@ -1,0 +1,8 @@
+[package]
+name = "ics-glance"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A small library and CLI for reading iCalendar (.ics) files"
+
+[dependencies]
