@@ -5,6 +5,8 @@
 //! CRLF/LF mixed line endings, quoted parameter values, and the standard
 //! backslash escapes inside property values.
 
+use std::fmt;
+
 /// A single unfolded, parsed content line: `NAME;PARAM=VAL;...:VALUE`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Property {
@@ -13,12 +15,150 @@ pub struct Property {
     pub value: String,
 }
 
+/// A calendar date (Gregorian), with no time or timezone attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Date {
+    pub year: i32,
+    pub month: u32,
+    pub day: u32,
+}
+
+impl Date {
+    fn parse(s: &str) -> Option<Date> {
+        if s.len() != 8 || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let year: i32 = s[0..4].parse().ok()?;
+        let month: u32 = s[4..6].parse().ok()?;
+        let day: u32 = s[6..8].parse().ok()?;
+        if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+            return None;
+        }
+        Some(Date { year, month, day })
+    }
+}
+
+impl fmt::Display for Date {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:04}-{:02}-{:02}", self.year, self.month, self.day)
+    }
+}
+
+/// A time of day, with no timezone attached (see `TimeKind` for that).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Time {
+    pub hour: u32,
+    pub minute: u32,
+    pub second: u32,
+}
+
+impl Time {
+    fn parse(s: &str) -> Option<Time> {
+        if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let hour: u32 = s[0..2].parse().ok()?;
+        let minute: u32 = s[2..4].parse().ok()?;
+        let second: u32 = s[4..6].parse().ok()?;
+        // second allows 60 for a leap second, per RFC 5545 3.3.12.
+        if hour > 23 || minute > 59 || second > 60 {
+            return None;
+        }
+        Some(Time { hour, minute, second })
+    }
+}
+
+impl fmt::Display for Time {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:02}:{:02}:{:02}", self.hour, self.minute, self.second)
+    }
+}
+
+/// How a date-time's timezone was specified in the source property.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimeKind {
+    /// No `Z` suffix and no `TZID`: local to whatever reads it back.
+    Floating,
+    /// Trailing `Z` on the value.
+    Utc,
+    /// `TZID` parameter naming a timezone; not resolved to an offset here.
+    Zone(String),
+}
+
+/// A parsed `DTSTART`/`DTEND` value: either a bare date (`VALUE=DATE`)
+/// or a date paired with a time and its timezone kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DateTimeValue {
+    Date(Date),
+    DateTime {
+        date: Date,
+        time: Time,
+        kind: TimeKind,
+    },
+}
+
+impl fmt::Display for DateTimeValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DateTimeValue::Date(d) => write!(f, "{d}"),
+            DateTimeValue::DateTime { date, time, kind } => match kind {
+                TimeKind::Floating => write!(f, "{date} {time}"),
+                TimeKind::Utc => write!(f, "{date} {time} UTC"),
+                TimeKind::Zone(tz) => write!(f, "{date} {time} {tz}"),
+            },
+        }
+    }
+}
+
+/// Parses a `DTSTART`/`DTEND`-shaped property into a `DateTimeValue`.
+///
+/// Honors an explicit `VALUE=DATE` parameter; failing that, the shape of
+/// the value decides (no `T` means a bare date). A trailing `Z` on the
+/// value means UTC; otherwise a `TZID` parameter names the timezone;
+/// otherwise the time is floating (RFC 5545 section 3.3.5).
+pub fn parse_date_time(prop: &Property) -> Option<DateTimeValue> {
+    let value_is_date = prop
+        .params
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("VALUE") && v.eq_ignore_ascii_case("DATE"));
+
+    if value_is_date || !prop.value.contains('T') {
+        return Some(DateTimeValue::Date(Date::parse(&prop.value)?));
+    }
+
+    let mut parts = prop.value.splitn(2, 'T');
+    let date_part = parts.next()?;
+    let mut time_part = parts.next()?;
+
+    let is_utc = time_part.ends_with('Z');
+    if is_utc {
+        time_part = &time_part[..time_part.len() - 1];
+    }
+
+    let date = Date::parse(date_part)?;
+    let time = Time::parse(time_part)?;
+
+    let kind = if is_utc {
+        TimeKind::Utc
+    } else if let Some((_, tzid)) = prop
+        .params
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("TZID"))
+    {
+        TimeKind::Zone(tzid.clone())
+    } else {
+        TimeKind::Floating
+    };
+
+    Some(DateTimeValue::DateTime { date, time, kind })
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Event {
     pub uid: Option<String>,
     pub summary: Option<String>,
-    pub dtstart: Option<String>,
-    pub dtend: Option<String>,
+    pub dtstart: Option<DateTimeValue>,
+    pub dtend: Option<DateTimeValue>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -182,12 +322,12 @@ pub fn parse_calendar(text: &str) -> Calendar {
             }
             "DTSTART" => {
                 if let Some(event) = current.as_mut() {
-                    event.dtstart = Some(prop.value);
+                    event.dtstart = parse_date_time(&prop);
                 }
             }
             "DTEND" => {
                 if let Some(event) = current.as_mut() {
-                    event.dtend = Some(prop.value);
+                    event.dtend = parse_date_time(&prop);
                 }
             }
             _ => {}

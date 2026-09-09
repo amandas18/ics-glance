@@ -1,4 +1,7 @@
-use ics_glance::{parse_calendar, parse_property, unescape_value, unfold};
+use ics_glance::{
+    parse_calendar, parse_date_time, parse_property, unescape_value, unfold, DateTimeValue,
+    TimeKind,
+};
 
 #[test]
 fn unfold_handles_awkward_line_endings_and_folding() {
@@ -166,5 +169,87 @@ fn parse_calendar_extracts_events_table_driven() {
             .map(|e| e.summary.as_deref().unwrap_or(""))
             .collect();
         assert_eq!(got, case.want_summaries, "case failed: {}", case.name);
+    }
+}
+
+#[test]
+fn parse_date_time_handles_date_and_datetime_shapes() {
+    struct Case {
+        name: &'static str,
+        line: &'static str,
+        want: Option<&'static str>,
+    }
+
+    let cases: &[Case] = &[
+        Case {
+            name: "explicit VALUE=DATE",
+            line: "DTSTART;VALUE=DATE:20260101",
+            want: Some("2026-01-01"),
+        },
+        Case {
+            name: "bare date value with no VALUE param",
+            line: "DTSTART:20260101",
+            want: Some("2026-01-01"),
+        },
+        Case {
+            name: "floating date-time, no Z and no TZID",
+            line: "DTSTART:20260112T090000",
+            want: Some("2026-01-12 09:00:00"),
+        },
+        Case {
+            name: "utc date-time",
+            line: "DTSTART:20260112T090000Z",
+            want: Some("2026-01-12 09:00:00 UTC"),
+        },
+        Case {
+            name: "date-time with TZID",
+            line: "DTSTART;TZID=America/New_York:20260112T090000",
+            want: Some("2026-01-12 09:00:00 America/New_York"),
+        },
+        Case {
+            name: "malformed date is rejected",
+            line: "DTSTART;VALUE=DATE:2026-01-01",
+            want: None,
+        },
+        Case {
+            name: "hour out of range is rejected",
+            line: "DTSTART:20260112T250000",
+            want: None,
+        },
+    ];
+
+    for case in cases {
+        let prop = parse_property(case.line)
+            .unwrap_or_else(|| panic!("property failed to parse at all: {}", case.name));
+        let got = parse_date_time(&prop).map(|v| v.to_string());
+        assert_eq!(
+            got.as_deref(),
+            case.want,
+            "case failed: {}",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn parse_date_time_reports_timezone_kind() {
+    let floating = parse_property("DTSTART:20260112T090000").unwrap();
+    match parse_date_time(&floating) {
+        Some(DateTimeValue::DateTime { kind, .. }) => assert_eq!(kind, TimeKind::Floating),
+        other => panic!("expected floating date-time, got {other:?}"),
+    }
+
+    let utc = parse_property("DTSTART:20260112T090000Z").unwrap();
+    match parse_date_time(&utc) {
+        Some(DateTimeValue::DateTime { kind, .. }) => assert_eq!(kind, TimeKind::Utc),
+        other => panic!("expected utc date-time, got {other:?}"),
+    }
+
+    let zoned = parse_property("DTSTART;TZID=America/Chicago:20260112T090000").unwrap();
+    match parse_date_time(&zoned) {
+        Some(DateTimeValue::DateTime { kind, .. }) => {
+            assert_eq!(kind, TimeKind::Zone("America/Chicago".to_string()))
+        }
+        other => panic!("expected zoned date-time, got {other:?}"),
     }
 }

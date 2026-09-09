@@ -16,8 +16,11 @@ tidy case and breaks the first time it sees a real file.
 This library handles line unfolding, quoted parameter values, and the
 standard backslash escapes (`\,`, `\;`, `\\`, `\n`) as first-class cases,
 not afterthoughts. It currently reads `VEVENT` blocks (`UID`, `SUMMARY`,
-`DTSTART`, `DTEND`) out of a calendar; it does not write `.ics` files or
-resolve recurrence rules yet.
+`DTSTART`, `DTEND`) out of a calendar. `DTSTART`/`DTEND` are parsed into a
+`DateTimeValue` that distinguishes a bare date (`VALUE=DATE`) from a
+date-time, and for date-times, whether the time is floating, UTC (a
+trailing `Z`), or tied to a named zone via `TZID`; it does not yet resolve
+`TZID` to an actual offset, write `.ics` files, or expand recurrence rules.
 
 ## Library usage
 
@@ -28,11 +31,12 @@ let text = std::fs::read_to_string("calendar.ics").unwrap();
 let calendar = parse_calendar(&text);
 
 for event in &calendar.events {
-    println!(
-        "{} - {}",
-        event.dtstart.as_deref().unwrap_or("?"),
-        event.summary.as_deref().unwrap_or("(untitled)"),
-    );
+    let start = event
+        .dtstart
+        .as_ref()
+        .map(|d| d.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    println!("{start} - {}", event.summary.as_deref().unwrap_or("(untitled)"));
 }
 ```
 
@@ -57,7 +61,7 @@ DTSTART:20260112T090000
 END:VEVENT
 END:VCALENDAR
 $ cargo run -- meeting.ics
-20260112T090000  Weekly sync
+2026-01-12 09:00:00  Weekly sync
 ```
 
 ## Building

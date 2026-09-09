@@ -29,7 +29,11 @@ fn main() -> ExitCode {
     }
 
     for event in &calendar.events {
-        let start = event.dtstart.as_deref().unwrap_or("(no start)");
+        let start = event
+            .dtstart
+            .as_ref()
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "(no start)".to_string());
         let summary = event.summary.as_deref().unwrap_or("(no summary)");
         println!("{start}  {summary}");
     }
