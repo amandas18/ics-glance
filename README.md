@@ -16,11 +16,14 @@ tidy case and breaks the first time it sees a real file.
 This library handles line unfolding, quoted parameter values, and the
 standard backslash escapes (`\,`, `\;`, `\\`, `\n`) as first-class cases,
 not afterthoughts. It currently reads `VEVENT` blocks (`UID`, `SUMMARY`,
-`DTSTART`, `DTEND`) out of a calendar. `DTSTART`/`DTEND` are parsed into a
-`DateTimeValue` that distinguishes a bare date (`VALUE=DATE`) from a
-date-time, and for date-times, whether the time is floating, UTC (a
-trailing `Z`), or tied to a named zone via `TZID`; it does not yet resolve
-`TZID` to an actual offset, write `.ics` files, or expand recurrence rules.
+`DTSTART`, `DTEND`, `RRULE`) out of a calendar. `DTSTART`/`DTEND` are
+parsed into a `DateTimeValue` that distinguishes a bare date (`VALUE=DATE`)
+from a date-time, and for date-times, whether the time is floating, UTC (a
+trailing `Z`), or tied to a named zone via `TZID`. `RRULE` is parsed into a
+`Recurrence` and can be expanded into a sequence of occurrences, but only
+for `FREQ`/`INTERVAL`/`COUNT`/`UNTIL`; `BYDAY`/`BYMONTHDAY`/etc selectors
+aren't handled. It does not yet resolve `TZID` to an actual offset or
+write `.ics` files.
 
 ## Library usage
 
@@ -37,6 +40,18 @@ for event in &calendar.events {
         .map(|d| d.to_string())
         .unwrap_or_else(|| "?".to_string());
     println!("{start} - {}", event.summary.as_deref().unwrap_or("(untitled)"));
+}
+```
+
+To expand a recurring event, pass its `DTSTART` and `RRULE` to `expand`
+along with a cap on how many occurrences to generate (a rule with neither
+`COUNT` nor `UNTIL` repeats forever, so the cap is what stops it):
+
+```rust
+if let (Some(dtstart), Some(rrule)) = (&event.dtstart, &event.rrule) {
+    for occurrence in rrule.expand(dtstart, 52) {
+        println!("{occurrence}");
+    }
 }
 ```
 

@@ -1,6 +1,6 @@
 use ics_glance::{
-    parse_calendar, parse_date_time, parse_property, unescape_value, unfold, DateTimeValue,
-    TimeKind,
+    parse_calendar, parse_date_time, parse_property, parse_rrule, unescape_value, unfold, Date,
+    DateTimeValue, Freq, Recurrence, TimeKind,
 };
 
 #[test]
@@ -252,4 +252,129 @@ fn parse_date_time_reports_timezone_kind() {
         }
         other => panic!("expected zoned date-time, got {other:?}"),
     }
+}
+
+#[test]
+fn parse_rrule_reads_freq_interval_count_and_until() {
+    struct Case {
+        name: &'static str,
+        value: &'static str,
+        want: Option<Recurrence>,
+    }
+
+    let cases: &[Case] = &[
+        Case {
+            name: "bare daily",
+            value: "FREQ=DAILY",
+            want: Some(Recurrence { freq: Freq::Daily, interval: 1, count: None, until: None }),
+        },
+        Case {
+            name: "weekly with interval and count",
+            value: "FREQ=WEEKLY;INTERVAL=2;COUNT=5",
+            want: Some(Recurrence {
+                freq: Freq::Weekly,
+                interval: 2,
+                count: Some(5),
+                until: None,
+            }),
+        },
+        Case {
+            name: "monthly with until date",
+            value: "FREQ=MONTHLY;UNTIL=20261231",
+            want: Some(Recurrence {
+                freq: Freq::Monthly,
+                interval: 1,
+                count: None,
+                until: Some(DateTimeValue::Date(Date { year: 2026, month: 12, day: 31 })),
+            }),
+        },
+        Case {
+            name: "missing freq is rejected",
+            value: "INTERVAL=2",
+            want: None,
+        },
+        Case {
+            name: "unknown freq is rejected",
+            value: "FREQ=HOURLY",
+            want: None,
+        },
+        Case {
+            name: "zero interval is rejected",
+            value: "FREQ=DAILY;INTERVAL=0",
+            want: None,
+        },
+    ];
+
+    for case in cases {
+        let got = parse_rrule(case.value);
+        assert_eq!(got, case.want, "case failed: {}", case.name);
+    }
+}
+
+#[test]
+fn recurrence_expand_generates_the_right_dates() {
+    struct Case {
+        name: &'static str,
+        rrule: &'static str,
+        dtstart: &'static str,
+        limit: usize,
+        want: &'static [&'static str],
+    }
+
+    let cases: &[Case] = &[
+        Case {
+            name: "daily for 3 days",
+            rrule: "FREQ=DAILY;COUNT=3",
+            dtstart: "DTSTART:20260101",
+            limit: 10,
+            want: &["2026-01-01", "2026-01-02", "2026-01-03"],
+        },
+        Case {
+            name: "weekly interval 2, stopped by until",
+            rrule: "FREQ=WEEKLY;INTERVAL=2;UNTIL=20260201",
+            dtstart: "DTSTART:20260101",
+            limit: 10,
+            want: &["2026-01-01", "2026-01-15", "2026-01-29"],
+        },
+        Case {
+            name: "monthly skips a month with no matching day",
+            rrule: "FREQ=MONTHLY;COUNT=4",
+            dtstart: "DTSTART;VALUE=DATE:20260131",
+            limit: 10,
+            want: &["2026-01-31", "2026-03-31", "2026-05-31", "2026-07-31"],
+        },
+        Case {
+            name: "yearly leap day skips non-leap years",
+            rrule: "FREQ=YEARLY;COUNT=2",
+            dtstart: "DTSTART;VALUE=DATE:20240229",
+            limit: 10,
+            want: &["2024-02-29", "2028-02-29"],
+        },
+        Case {
+            name: "limit caps an open-ended rule",
+            rrule: "FREQ=DAILY",
+            dtstart: "DTSTART:20260101",
+            limit: 3,
+            want: &["2026-01-01", "2026-01-02", "2026-01-03"],
+        },
+    ];
+
+    for case in cases {
+        let dtstart_prop = parse_property(case.dtstart).unwrap();
+        let dtstart = parse_date_time(&dtstart_prop).unwrap();
+        let rrule = parse_rrule(case.rrule).unwrap();
+        let got: Vec<String> =
+            rrule.expand(&dtstart, case.limit).iter().map(|d| d.to_string()).collect();
+        assert_eq!(got, case.want, "case failed: {}", case.name);
+    }
+}
+
+#[test]
+fn parse_calendar_picks_up_rrule_on_an_event() {
+    let text = "BEGIN:VEVENT\nSUMMARY:Standup\nDTSTART:20260101\nRRULE:FREQ=DAILY;COUNT=5\nEND:VEVENT\n";
+    let calendar = parse_calendar(text);
+    let event = &calendar.events[0];
+    let rrule = event.rrule.as_ref().expect("expected an rrule on the event");
+    assert_eq!(rrule.freq, Freq::Daily);
+    assert_eq!(rrule.count, Some(5));
 }

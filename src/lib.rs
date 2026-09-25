@@ -16,7 +16,7 @@ pub struct Property {
 }
 
 /// A calendar date (Gregorian), with no time or timezone attached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Date {
     pub year: i32,
     pub month: u32,
@@ -45,7 +45,7 @@ impl fmt::Display for Date {
 }
 
 /// A time of day, with no timezone attached (see `TimeKind` for that).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Time {
     pub hour: u32,
     pub minute: u32,
@@ -110,6 +110,31 @@ impl fmt::Display for DateTimeValue {
     }
 }
 
+/// Parses the date/date-time shape shared by DTSTART, DTEND, and an
+/// RRULE's UNTIL value, without any parameter handling. UNTIL never
+/// carries its own TZID - RFC 5545 requires it to match DTSTART's value
+/// type, using UTC rather than a zone for date-times.
+fn parse_date_time_value(value: &str) -> Option<DateTimeValue> {
+    if !value.contains('T') {
+        return Some(DateTimeValue::Date(Date::parse(value)?));
+    }
+
+    let mut parts = value.splitn(2, 'T');
+    let date_part = parts.next()?;
+    let mut time_part = parts.next()?;
+
+    let is_utc = time_part.ends_with('Z');
+    if is_utc {
+        time_part = &time_part[..time_part.len() - 1];
+    }
+
+    let date = Date::parse(date_part)?;
+    let time = Time::parse(time_part)?;
+    let kind = if is_utc { TimeKind::Utc } else { TimeKind::Floating };
+
+    Some(DateTimeValue::DateTime { date, time, kind })
+}
+
 /// Parses a `DTSTART`/`DTEND`-shaped property into a `DateTimeValue`.
 ///
 /// Honors an explicit `VALUE=DATE` parameter; failing that, the shape of
@@ -122,35 +147,243 @@ pub fn parse_date_time(prop: &Property) -> Option<DateTimeValue> {
         .iter()
         .any(|(k, v)| k.eq_ignore_ascii_case("VALUE") && v.eq_ignore_ascii_case("DATE"));
 
-    if value_is_date || !prop.value.contains('T') {
+    if value_is_date {
         return Some(DateTimeValue::Date(Date::parse(&prop.value)?));
     }
 
-    let mut parts = prop.value.splitn(2, 'T');
-    let date_part = parts.next()?;
-    let mut time_part = parts.next()?;
+    let mut result = parse_date_time_value(&prop.value)?;
+    if let DateTimeValue::DateTime { kind, .. } = &mut result {
+        if *kind == TimeKind::Floating {
+            if let Some((_, tzid)) = prop
+                .params
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("TZID"))
+            {
+                *kind = TimeKind::Zone(tzid.clone());
+            }
+        }
+    }
+    Some(result)
+}
 
-    let is_utc = time_part.ends_with('Z');
-    if is_utc {
-        time_part = &time_part[..time_part.len() - 1];
+/// The `FREQ` of an `RRULE` (RFC 5545 section 3.3.10). Only the four base
+/// frequencies are handled; sub-daily ones (`HOURLY`, `MINUTELY`,
+/// `SECONDLY`) don't show up in real calendars often enough to bother with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freq {
+    Daily,
+    Weekly,
+    Monthly,
+    Yearly,
+}
+
+/// A parsed `RRULE` value covering `FREQ`, `INTERVAL`, `COUNT`, and
+/// `UNTIL`. It does not understand `BYDAY`/`BYMONTHDAY`/etc selectors, so
+/// a rule that depends on one of those (e.g. "every 2nd Tuesday") will
+/// parse but `expand` won't produce the selective sequence it implies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recurrence {
+    pub freq: Freq,
+    pub interval: u32,
+    pub count: Option<u32>,
+    pub until: Option<DateTimeValue>,
+}
+
+/// Parses an `RRULE` property value, e.g. `FREQ=WEEKLY;INTERVAL=2;COUNT=10`.
+pub fn parse_rrule(value: &str) -> Option<Recurrence> {
+    let mut freq: Option<Freq> = None;
+    let mut interval: u32 = 1;
+    let mut count: Option<u32> = None;
+    let mut until: Option<DateTimeValue> = None;
+
+    for part in value.split(';') {
+        if part.is_empty() {
+            continue;
+        }
+        let mut kv = part.splitn(2, '=');
+        let key = kv.next()?;
+        let val = kv.next()?;
+        match key {
+            "FREQ" => {
+                freq = Some(match val {
+                    "DAILY" => Freq::Daily,
+                    "WEEKLY" => Freq::Weekly,
+                    "MONTHLY" => Freq::Monthly,
+                    "YEARLY" => Freq::Yearly,
+                    _ => return None,
+                });
+            }
+            "INTERVAL" => interval = val.parse().ok().filter(|n| *n > 0)?,
+            "COUNT" => count = Some(val.parse().ok()?),
+            "UNTIL" => until = Some(parse_date_time_value(val)?),
+            _ => {}
+        }
     }
 
-    let date = Date::parse(date_part)?;
-    let time = Time::parse(time_part)?;
+    Some(Recurrence {
+        freq: freq?,
+        interval,
+        count,
+        until,
+    })
+}
 
-    let kind = if is_utc {
-        TimeKind::Utc
-    } else if let Some((_, tzid)) = prop
-        .params
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("TZID"))
-    {
-        TimeKind::Zone(tzid.clone())
+impl Recurrence {
+    /// Expands this rule into a sequence of occurrences starting at
+    /// `dtstart` (included). Stops at the first of: `COUNT`, `UNTIL`, or
+    /// `limit` occurrences - `limit` matters because a rule with neither
+    /// `COUNT` nor `UNTIL` repeats forever.
+    ///
+    /// For `MONTHLY`/`YEARLY` rules, an interim date that doesn't exist
+    /// (e.g. day 31 landing on April) is skipped rather than clamped,
+    /// per RFC 5545.
+    pub fn expand(&self, dtstart: &DateTimeValue, limit: usize) -> Vec<DateTimeValue> {
+        let mut out = Vec::new();
+        let mut current = dtstart.clone();
+        let mut produced: u32 = 0;
+
+        loop {
+            if out.len() >= limit {
+                break;
+            }
+            if let Some(count) = self.count {
+                if produced >= count {
+                    break;
+                }
+            }
+            if let Some(until) = &self.until {
+                if current.instant() > until.instant() {
+                    break;
+                }
+            }
+
+            out.push(current.clone());
+            produced += 1;
+
+            match advance_date(current.date(), self.freq, self.interval) {
+                Some(next_date) => current = current.with_date(next_date),
+                None => break,
+            }
+        }
+
+        out
+    }
+}
+
+impl DateTimeValue {
+    fn date(&self) -> Date {
+        match self {
+            DateTimeValue::Date(d) => *d,
+            DateTimeValue::DateTime { date, .. } => *date,
+        }
+    }
+
+    fn instant(&self) -> (Date, Time) {
+        match self {
+            DateTimeValue::Date(d) => (*d, Time { hour: 0, minute: 0, second: 0 }),
+            DateTimeValue::DateTime { date, time, .. } => (*date, *time),
+        }
+    }
+
+    fn with_date(&self, date: Date) -> DateTimeValue {
+        match self {
+            DateTimeValue::Date(_) => DateTimeValue::Date(date),
+            DateTimeValue::DateTime { time, kind, .. } => DateTimeValue::DateTime {
+                date,
+                time: *time,
+                kind: kind.clone(),
+            },
+        }
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => unreachable!("month out of range: {month}"),
+    }
+}
+
+/// Days since 1970-01-01, via Howard Hinnant's `days_from_civil`
+/// algorithm (proleptic Gregorian, correct across the full `i32` year range).
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { i64::from(year) - 1 } else { i64::from(year) };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (i64::from(month) + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Inverse of `days_from_civil`.
+fn civil_from_days(z: i64) -> Date {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = if month <= 2 { y + 1 } else { y };
+    Date { year: year as i32, month, day }
+}
+
+fn add_days(date: Date, days: i64) -> Date {
+    civil_from_days(days_from_civil(date.year, date.month, date.day) + days)
+}
+
+/// Adds a number of months, keeping the day of month. Returns `None`
+/// when the target month doesn't have that day (e.g. day 31 in April).
+fn add_months(date: Date, months: i64) -> Option<Date> {
+    let total = i64::from(date.year) * 12 + i64::from(date.month - 1) + months;
+    let year = total.div_euclid(12) as i32;
+    let month = (total.rem_euclid(12) + 1) as u32;
+    if date.day > days_in_month(year, month) {
+        None
     } else {
-        TimeKind::Floating
-    };
+        Some(Date { year, month, day: date.day })
+    }
+}
 
-    Some(DateTimeValue::DateTime { date, time, kind })
+/// Advances `date` by one step of `freq`/`interval`.
+fn advance_date(date: Date, freq: Freq, interval: u32) -> Option<Date> {
+    let interval = i64::from(interval);
+    match freq {
+        Freq::Daily => Some(add_days(date, interval)),
+        Freq::Weekly => Some(add_days(date, 7 * interval)),
+        Freq::Monthly => advance_by_months(date, interval),
+        Freq::Yearly => advance_by_months(date, interval * 12),
+    }
+}
+
+/// Keeps adding another `step` months past a nonexistent target date
+/// (RFC 5545's "that occurrence is skipped" rule) instead of clamping it.
+/// Bounded to 48 tries, which comfortably covers any interval/day-of-month
+/// combination since day-of-month can only ever land on so many months.
+fn advance_by_months(date: Date, step: i64) -> Option<Date> {
+    let mut total = step;
+    for _ in 0..48 {
+        if let Some(next) = add_months(date, total) {
+            return Some(next);
+        }
+        total += step;
+    }
+    None
 }
 
 #[derive(Debug, Clone, Default)]
@@ -159,6 +392,7 @@ pub struct Event {
     pub summary: Option<String>,
     pub dtstart: Option<DateTimeValue>,
     pub dtend: Option<DateTimeValue>,
+    pub rrule: Option<Recurrence>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -328,6 +562,11 @@ pub fn parse_calendar(text: &str) -> Calendar {
             "DTEND" => {
                 if let Some(event) = current.as_mut() {
                     event.dtend = parse_date_time(&prop);
+                }
+            }
+            "RRULE" => {
+                if let Some(event) = current.as_mut() {
+                    event.rrule = parse_rrule(&prop.value);
                 }
             }
             _ => {}
